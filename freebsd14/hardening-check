@@ -1,16 +1,15 @@
 #!/usr/bin/env php
 <?php
 // =================================================================
-// Hardening Check Tool
+// Hardening Check Tool v1.0.0
 // =================================================================
 
 // --- Constants & Setup ---
 define('TOOL_VERSION', '1.0.0');
-// Use FreeBSD's standard path for configuration files
 define('PROFILES_DIR', '/usr/local/etc/hardening-check/profiles/');
 define('IS_ROOT', trim(shell_exec('id -u')) === '0');
 
-$options = getopt("p:s:ahorc:", ["profile:", "section:", "all", "help", "output", "remote:", "cron"]);
+$options = getopt("p:s:ahoc", ["profile:", "section:", "all", "help", "output", "cron"]);
 define('VERBOSE_OUTPUT', isset($options['o']) || isset($options['output']));
 define('CRON_OUTPUT', isset($options['c']) || isset($options['cron']));
 
@@ -30,79 +29,16 @@ $SYSTEM_STATE = [];
 $SUMMARY = ['total' => 0, 'pass' => 0, 'fail' => 0, 'manual' => 0, 'error' => 0, 'skipped' => 0];
 
 // --- Main Execution ---
-$remote_target_arg = $options['r'] ?? $options['remote'] ?? null;
-
 if (isset($options['h']) || isset($options['help']) || (empty($options) && count($argv) === 1) || (!isset($options['p']) && !isset($options['profile']))) {
     show_help();
     exit(0);
 }
 
-// if ($remote_target_arg) {
-//     run_remote_check($remote_target_arg, $options);
-// } else {
-//     run_local_check($options);
-// }
-// exit(0);
+run_local_check($options);
+exit(0);
+
 
 // --- Core Functions ---
-
-// function run_remote_check(string $remote_target_arg, array $options) {
-//     if (strpos($remote_target_arg, '@') === false) {
-//         $current_user = trim(shell_exec('whoami'));
-//         if (!$current_user) {
-//             echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not determine current username. Please use 'user@host' format." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
-//             exit(1);
-//         }
-//         $ssh_target = "{$current_user}@{$remote_target_arg}";
-//         echo "[INFO] No username provided. Using current user: " . (CRON_OUTPUT ? '' : COLOR_YELLOW) . $current_user . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
-//     } else {
-//         $ssh_target = $remote_target_arg;
-//     }
-//     $profile_id = $options['p'] ?? $options['profile'];
-//     $local_profile_path = PROFILES_DIR . $profile_id;
-//     $remote_temp_dir = "/tmp/hardening_check_" . time();
-//     $remote_command = "sudo $remote_temp_dir/hardening-check --profile $profile_id";
-
-//     if (isset($options['s']) || isset($options['section'])) {
-//         $section = escapeshellarg($options['s'] ?? $options['section']);
-//         $remote_command .= " --section $section";
-//     }
-//     if (VERBOSE_OUTPUT) {
-//         $remote_command .= " --output";
-//     }
-//     if (CRON_OUTPUT) {
-//         $remote_command .= " --cron";
-//     }
-
-//     echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "--- Starting Remote Check on: " . (CRON_OUTPUT ? '' : COLOR_YELLOW) . $ssh_target . (CRON_OUTPUT ? '' : STYLE_RESET) . " ---\n";
-//     $ssh_options = "-o StrictHostKeyChecking=no -o ConnectTimeout=10";
-
-//     echo "1. Creating remote directory...\n";
-//     passthru("ssh $ssh_options $ssh_target \"mkdir -p $remote_temp_dir/profiles\"", $return_var);
-//     if ($return_var !== 0) {
-//         echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not create directory on remote host." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
-//         passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
-//         exit(1);
-//     }
-
-//     echo "2. Copying files...\n";
-//     passthru("scp $ssh_options " . __FILE__ . " $ssh_target:$remote_temp_dir/", $return_var);
-//     passthru("scp $ssh_options -r $local_profile_path " . $ssh_target . ":" . $remote_temp_dir . "/profiles/", $return_var_2);
-//     if ($return_var !== 0 || $return_var_2 !== 0) {
-//         echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not copy files to remote host." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
-//         passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
-//         exit(1);
-//     }
-
-//     echo "3. Running audit on remote host...\n";
-//     echo (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('-', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n\n";
-//     passthru("ssh $ssh_options $ssh_target \"$remote_command\"", $return_var);
-//     echo "\n" . (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('-', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
-
-//     echo "4. Cleaning up remote host...\n";
-//     passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
-//     echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "--- Remote Check Complete ---\n" . (CRON_OUTPUT ? '' : STYLE_RESET);
-// }
 
 function run_local_check(array $options) {
     $profile_id = $options['p'] ?? $options['profile'];
@@ -228,12 +164,13 @@ function run_check(array $check): array {
     }
     if ($check['type'] === 'Manual' && empty($check['audit_script'])) { return ['status' => 'MANUAL', 'output' => 'Manual verification required.']; }
     if (empty($check['audit_script'])) { return ['status' => 'ERROR', 'output' => 'No audit script.']; }
+    
     $command = "sh -c " . escapeshellarg($check['audit_script']);
     $output = shell_exec($command . ' 2>&1') ?? '';
     $status = 'MANUAL';
     if (stripos($output, '** PASS **') !== false) $status = 'PASS';
     elseif (stripos($output, '** FAIL **') !== false) $status = 'FAIL';
-    elseif (stripos($output, '** MANUAL **') !== false) $status = 'MANUAL';
+    elseif (stripos($output, '** REVIEW **') !== false) $status = 'MANUAL';
     elseif (stripos($output, '** SKIPPED **') !== false) $status = 'SKIPPED';
 
     if (isset($check['sets_state'])) {
@@ -253,7 +190,7 @@ function generate_summary_report() {
     echo "Total Checks: " . ($executed < 0 ? 0 : $executed) . " Executed | ";
     echo (CRON_OUTPUT ? '' : COLOR_GREEN) . "Passed: " . $SUMMARY['pass'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
     echo (CRON_OUTPUT ? '' : COLOR_RED) . "Failed: " . $SUMMARY['fail'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
-    echo (CRON_OUTPUT ? '' : COLOR_BLUE) . "Manual/Review: " . $SUMMARY['manual'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
+    echo (CRON_OUTPUT ? '' : COLOR_BLUE) . "Manual: " . $SUMMARY['manual'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
     echo (CRON_OUTPUT ? '' : COLOR_YELLOW) . "Error: " . $SUMMARY['error'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
     echo (CRON_OUTPUT ? '' : COLOR_GRAY) . "Skipped: " . $SUMMARY['skipped'] . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
     echo (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('=', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
@@ -266,7 +203,6 @@ function show_help() {
     echo "  -p, --profile     Specify the profile to use (file or directory name).\n";
     echo "  -s, --section     Specify sections to run from a profile directory.\n";
     echo "  -a, --all         Run all sections in the profile directory (default).\n";
-    // echo "  -r, --remote      Run the audit on a remote host (e.g., 'ip' or 'user@ip').\n";
     echo "  -o, --output      Display full, detailed audit output for each check.\n";
     echo "  -c, --cron        Generate concise output without color, suitable for cronjobs.\n";
     echo "  -h, --help        Show this help message.\n\n";
