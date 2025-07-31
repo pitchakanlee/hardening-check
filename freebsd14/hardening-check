@@ -1,0 +1,297 @@
+#!/usr/bin/env php
+<?php
+// =================================================================
+// Hardening Check Tool v1.3.2 (FreeBSD Final)
+// =================================================================
+
+// --- Constants & Setup ---
+define('TOOL_VERSION', '1.3.2');
+// Use FreeBSD's standard path for configuration files
+define('PROFILES_DIR', '/usr/local/etc/hardening-check/profiles/');
+define('IS_ROOT', trim(shell_exec('id -u')) === '0');
+
+$options = getopt("p:s:ahorc:", ["profile:", "section:", "all", "help", "output", "remote:", "cron"]);
+define('VERBOSE_OUTPUT', isset($options['o']) || isset($options['output']));
+define('CRON_OUTPUT', isset($options['c']) || isset($options['cron']));
+
+// --- Style Constants ---
+define('STYLE_RESET', CRON_OUTPUT ? '' : "\033[0m");
+define('STYLE_BOLD', CRON_OUTPUT ? '' : "\033[1m");
+define('COLOR_GREEN', CRON_OUTPUT ? '' : "\033[92m");
+define('COLOR_RED', CRON_OUTPUT ? '' : "\033[91m");
+define('COLOR_BLUE', CRON_OUTPUT ? '' : "\033[94m");
+define('COLOR_YELLOW', CRON_OUTPUT ? '' : "\033[93m");
+define('COLOR_PURPLE', CRON_OUTPUT ? '' : "\033[95m");
+define('COLOR_GRAY', CRON_OUTPUT ? '' : "\033[90m");
+define('COLOR_CYAN', CRON_OUTPUT ? '' : "\033[96m");
+
+// --- Global State & Summary ---
+$SYSTEM_STATE = [];
+$SUMMARY = ['total' => 0, 'pass' => 0, 'fail' => 0, 'manual' => 0, 'error' => 0, 'skipped' => 0];
+
+// --- Main Execution ---
+$remote_target_arg = $options['r'] ?? $options['remote'] ?? null;
+
+if (isset($options['h']) || isset($options['help']) || (empty($options) && count($argv) === 1) || (!isset($options['p']) && !isset($options['profile']))) {
+    show_help();
+    exit(0);
+}
+
+if ($remote_target_arg) {
+    run_remote_check($remote_target_arg, $options);
+} else {
+    run_local_check($options);
+}
+exit(0);
+
+// --- Core Functions ---
+
+function run_remote_check(string $remote_target_arg, array $options) {
+    if (strpos($remote_target_arg, '@') === false) {
+        // <<< FIXED: Use shell_exec('whoami') for FreeBSD compatibility >>>
+        $current_user = trim(shell_exec('whoami'));
+        if (!$current_user) {
+            echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not determine current username. Please use 'user@host' format." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+            exit(1);
+        }
+        $ssh_target = "{$current_user}@{$remote_target_arg}";
+        echo "[INFO] No username provided. Using current user: " . (CRON_OUTPUT ? '' : COLOR_YELLOW) . $current_user . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+    } else {
+        $ssh_target = $remote_target_arg;
+    }
+    $profile_id = $options['p'] ?? $options['profile'];
+    $local_profile_path = PROFILES_DIR . $profile_id;
+    $remote_temp_dir = "/tmp/hardening_check_" . time();
+    $remote_command = "sudo $remote_temp_dir/hardening-check --profile $profile_id";
+
+    if (isset($options['s']) || isset($options['section'])) {
+        $section = escapeshellarg($options['s'] ?? $options['section']);
+        $remote_command .= " --section $section";
+    }
+    if (VERBOSE_OUTPUT) {
+        $remote_command .= " --output";
+    }
+    if (CRON_OUTPUT) {
+        $remote_command .= " --cron";
+    }
+
+    echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "--- Starting Remote Check on: " . (CRON_OUTPUT ? '' : COLOR_YELLOW) . $ssh_target . (CRON_OUTPUT ? '' : STYLE_RESET) . " ---\n";
+    $ssh_options = "-o StrictHostKeyChecking=no -o ConnectTimeout=10";
+
+    echo "1. Creating remote directory...\n";
+    passthru("ssh $ssh_options $ssh_target \"mkdir -p $remote_temp_dir/profiles\"", $return_var);
+    if ($return_var !== 0) {
+        echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not create directory on remote host." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+        passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
+        exit(1);
+    }
+
+    echo "2. Copying files...\n";
+    passthru("scp $ssh_options " . __FILE__ . " $ssh_target:$remote_temp_dir/", $return_var);
+    passthru("scp $ssh_options -r $local_profile_path " . $ssh_target . ":" . $remote_temp_dir . "/profiles/", $return_var_2);
+    if ($return_var !== 0 || $return_var_2 !== 0) {
+        echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Could not copy files to remote host." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+        passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
+        exit(1);
+    }
+
+    echo "3. Running audit on remote host...\n";
+    echo (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('-', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n\n";
+    passthru("ssh $ssh_options $ssh_target \"$remote_command\"", $return_var);
+    echo "\n" . (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('-', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+
+    echo "4. Cleaning up remote host...\n";
+    passthru("ssh $ssh_options $ssh_target \"rm -rf $remote_temp_dir\"");
+    echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "--- Remote Check Complete ---\n" . (CRON_OUTPUT ? '' : STYLE_RESET);
+}
+
+function run_local_check(array $options) {
+    $profile_id = $options['p'] ?? $options['profile'];
+    $profile_path = PROFILES_DIR . $profile_id;
+    $files_to_run = [];
+    if (is_file($profile_path . '.php')) {
+        $files_to_run[] = $profile_path . '.php';
+    } elseif (is_dir($profile_path)) {
+        $files_to_run = resolve_section_files($profile_path, $options);
+    } else {
+        echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Profile '$profile_id' not found as a file or directory." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n\n";
+        show_help();
+        exit(1);
+    }
+    if (empty($files_to_run)) {
+        echo (CRON_OUTPUT ? '' : COLOR_YELLOW) . "Warning: No section files found to run for the given criteria." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+        exit(0);
+    }
+    echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "Starting Hardening Check" . (CRON_OUTPUT ? '' : STYLE_RESET) . "\nProfile: " . (CRON_OUTPUT ? '' : COLOR_YELLOW) . $profile_id . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+    if (!IS_ROOT) { echo (CRON_OUTPUT ? '' : COLOR_YELLOW) . "Warning: Running in non-privileged mode. Some checks will be skipped." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n"; }
+
+    foreach ($files_to_run as $file_path) {
+        echo "\n" . (CRON_OUTPUT ? '' : COLOR_CYAN) . "--- Running Profile Module: " . basename($file_path) . " ---" . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+        $all_items = require($file_path);
+        if (!is_array($all_items)) {
+            global $SUMMARY;
+            $SUMMARY['total']++;
+            $SUMMARY['error']++;
+            echo (CRON_OUTPUT ? '' : COLOR_RED) . "Error: Profile module '$file_path' is invalid." . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+            continue;
+        }
+        foreach ($all_items as $item) {
+            if (isset($item['type']) && $item['type'] === 'header') {
+                print_header($item);
+            } else {
+                print_check_result($item);
+            }
+        }
+    }
+    generate_summary_report();
+}
+
+function resolve_section_files(string $profile_dir, array $options): array {
+    $section_arg = $options['s'] ?? $options['section'] ?? null;
+    $run_all = isset($options['a']) || isset($options['all']);
+    if ($run_all || is_null($section_arg)) {
+        $files = glob($profile_dir . '/*.php');
+        sort($files, SORT_NATURAL);
+        return $files;
+    }
+    $files_to_run = [];
+    $sections_to_run = [];
+    foreach (explode(',', $section_arg) as $part) {
+        if (strpos($part, '-') !== false) {
+            list($start, $end) = explode('-', $part, 2);
+            if (is_numeric($start) && is_numeric($end)) {
+                $sections_to_run = array_merge($sections_to_run, range((int)$start, (int)$end));
+            }
+        } else {
+            if (is_numeric($part)) {
+                $sections_to_run[] = (int)$part;
+            }
+        }
+    }
+    $sections_to_run = array_unique($sections_to_run);
+    sort($sections_to_run);
+    $all_files = glob($profile_dir . '/*.php');
+    foreach ($all_files as $file) {
+        if (preg_match('/_(\d+)\.php$/', $file, $matches)) {
+            if (in_array((int)$matches[1], $sections_to_run)) {
+                $files_to_run[] = $file;
+            }
+        }
+    }
+    return $files_to_run;
+}
+
+function print_header(array $header_item) {
+    $title = $header_item['title'] ?? 'Unnamed Header';
+    $id = $header_item['id'] ?? '';
+    $level = substr_count($id, '.');
+    $prefix = str_repeat("#", $level + 1);
+    if ($level <= 1) { echo "\n"; }
+    echo (CRON_OUTPUT ? '' : COLOR_PURPLE) . (CRON_OUTPUT ? '' : STYLE_BOLD) . "$prefix [$id] $title" . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+}
+
+function print_check_result(array $check) {
+    global $SUMMARY;
+    $SUMMARY['total']++;
+    $result_data = run_check($check);
+    $status_key = strtolower($result_data['status']);
+    if (isset($SUMMARY[$status_key])) { $SUMMARY[$status_key]++; }
+
+    $status_color = '';
+    if (!CRON_OUTPUT) {
+        switch ($result_data['status']) {
+            case 'PASS':    $status_color = COLOR_GREEN; break;
+            case 'FAIL':    $status_color = COLOR_RED; break;
+            case 'MANUAL':  $status_color = COLOR_BLUE; break;
+            case 'SKIPPED': $status_color = COLOR_GRAY; break;
+            case 'ERROR':   $status_color = COLOR_YELLOW; break;
+            default:        $status_color = COLOR_YELLOW; break;
+        }
+    }
+
+    echo "[{$check['id']}] " . $status_color . "[{$result_data['status']}]" . (CRON_OUTPUT ? '' : STYLE_RESET) . " {$check['title']}\n";
+
+    if (VERBOSE_OUTPUT && !empty($result_data['output'])) {
+        if (CRON_OUTPUT) {
+            echo "  Output: " . trim(str_replace("\n", " ", $result_data['output'])) . "\n";
+        } else {
+            echo "\n" . COLOR_GRAY . "--- Audit Output ---\n" . trim($result_data['output']) . "\n--- End Output ---" . STYLE_RESET . "\n";
+        }
+    }
+}
+
+function run_check(array $check): array {
+    global $SYSTEM_STATE;
+    if (($check['requires_root'] ?? false) && !IS_ROOT) { return ['status' => 'SKIPPED', 'output' => 'Requires root privileges.']; }
+    if (isset($check['depends_on'])) {
+        $dependency = $check['depends_on'];
+        if (!isset($SYSTEM_STATE[$dependency]) || $SYSTEM_STATE[$dependency] === false) { return ['status' => 'SKIPPED', 'output' => "Dependency '{$dependency}' not met."]; }
+    }
+    if ($check['type'] === 'Manual' && empty($check['audit_script'])) { return ['status' => 'MANUAL', 'output' => 'Manual verification required.']; }
+    if (empty($check['audit_script'])) { return ['status' => 'ERROR', 'output' => 'No audit script.']; }
+    $command = "sh -c " . escapeshellarg($check['audit_script']);
+    $output = shell_exec($command . ' 2>&1') ?? '';
+    $status = 'MANUAL';
+    if (stripos($output, '** PASS **') !== false) $status = 'PASS';
+    elseif (stripos($output, '** FAIL **') !== false) $status = 'FAIL';
+    elseif (stripos($output, '** REVIEW **') !== false) $status = 'MANUAL';
+    elseif (stripos($output, '** SKIPPED **') !== false) $status = 'SKIPPED';
+
+    if (isset($check['sets_state'])) {
+        $state_name = $check['sets_state']['name'];
+        $pass_value = $check['sets_state']['pass_value'];
+        $fail_value = $check['sets_state']['fail_value'];
+        $SYSTEM_STATE[$state_name] = ($status === 'PASS') ? $pass_value : $fail_value;
+    }
+    return ['status' => $status, 'output' => trim($output)];
+}
+
+function generate_summary_report() {
+    global $SUMMARY;
+    echo "\n" . (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('=', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+    echo (CRON_OUTPUT ? '' : STYLE_BOLD) . "Scan Summary" . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+    $executed = $SUMMARY['total'] - $SUMMARY['skipped'] - $SUMMARY['error'];
+    echo "Total Checks: " . ($executed < 0 ? 0 : $executed) . " Executed | ";
+    echo (CRON_OUTPUT ? '' : COLOR_GREEN) . "Passed: " . $SUMMARY['pass'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
+    echo (CRON_OUTPUT ? '' : COLOR_RED) . "Failed: " . $SUMMARY['fail'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
+    echo (CRON_OUTPUT ? '' : COLOR_BLUE) . "Manual/Review: " . $SUMMARY['manual'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
+    echo (CRON_OUTPUT ? '' : COLOR_YELLOW) . "Error: " . $SUMMARY['error'] . (CRON_OUTPUT ? '' : STYLE_RESET) . " | ";
+    echo (CRON_OUTPUT ? '' : COLOR_GRAY) . "Skipped: " . $SUMMARY['skipped'] . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+    echo (CRON_OUTPUT ? '' : COLOR_GRAY) . str_repeat('=', 80) . (CRON_OUTPUT ? '' : STYLE_RESET) . "\n";
+}
+
+function show_help() {
+    echo STYLE_BOLD . "Hardening Check Tool v" . TOOL_VERSION . STYLE_RESET . "\n\n";
+    echo STYLE_BOLD . "Usage:" . STYLE_RESET . "\n  [sudo] hardening-check --profile <profile> [options]\n\n";
+    echo STYLE_BOLD . "Options:" . STYLE_RESET . "\n";
+    echo "  -p, --profile     Specify the profile to use (file or directory name).\n";
+    echo "  -s, --section     Specify sections to run from a profile directory.\n";
+    echo "  -a, --all         Run all sections in the profile directory (default).\n";
+    echo "  -r, --remote      Run the audit on a remote host (e.g., 'ip' or 'user@ip').\n";
+    echo "  -o, --output      Display full, detailed audit output for each check.\n";
+    echo "  -c, --cron        Generate concise output without color, suitable for cronjobs.\n";
+    echo "  -h, --help        Show this help message.\n\n";
+    echo STYLE_BOLD . "Available Profiles:" . STYLE_RESET . "\n";
+    $profiles = get_available_profiles();
+    if (empty($profiles)) {
+        echo "  No profiles found in " . PROFILES_DIR . "\n";
+    } else {
+        foreach ($profiles as $item) {
+            echo "  - " . COLOR_CYAN . $item . STYLE_RESET . "\n";
+        }
+    }
+    echo "\n";
+}
+
+function get_available_profiles(): array {
+    $profiles = [];
+    if (!is_dir(PROFILES_DIR)) return [];
+    $items = scandir(PROFILES_DIR);
+    foreach ($items as $item) {
+        if ($item[0] !== '.') {
+            $profiles[] = str_replace('.php', '', $item);
+        }
+    }
+    return $profiles;
+}
+?>
