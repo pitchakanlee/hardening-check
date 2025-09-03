@@ -78,7 +78,6 @@ $ hardening-check -p cis_freebsd-14_v1-0-1
 Output:
 
 ```
-$ sudo hardening-check -p cis_freebsd-14_v1-0-1
 Starting Hardening Check
 Profile: cis_freebsd-14_v1-0-1
 
