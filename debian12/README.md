@@ -1,4 +1,4 @@
-## Step to set up `hardening-check` for FreeBSD 14
+## Step to set up `hardening-check` for Debian 12
 
 > Note: running the script on FreeBSD 14 requires `PHP8.2` and `sudo`
 
